@@ -1,76 +1,116 @@
-import openai
+import anyio
+from openai import OpenAI
 from app.core.config import settings
-from app.services.jira_parser import simplify_jira_issue
 
-openai.api_key = settings.OPENAI_API_KEY
+# Initialize OpenAI client
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 
-def extract_test_steps_from_issue(issue_json: dict):
+async def generate_test_steps(prompt_text: str):
     """
-    Fetches structured context from a Jira issue using the parser,
-    and generates automated QA test steps using OpenAI GPT.
+    Generate structured QA test steps asynchronously using OpenAI GPT.
+    Safe for FastAPI async environment.
     """
-    simplified = simplify_jira_issue(issue_json)
-    llm_prompt = simplified["llm_prompt"]
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4-turbo",
-        messages=[
-            {"role": "system", "content": "You are an expert QA tester."},
-            {
-                "role": "user",
-                "content": (
-                    "You are a QA automation assistant. Based on the Jira issue details below, "
-                    "generate structured, step-by-step test cases that validate each acceptance criterion. "
-                    "Respond strictly in JSON with the following fields for each step: "
-                    "`step` (the action) and `expected_result` (the validation outcome).\n\n"
-                    f"{llm_prompt}"
-                ),
-            },
-        ],
+    user_prompt = (
+        "You are a QA automation assistant. Based on the Jira issue details below, "
+        "generate structured, step-by-step test cases that validate each acceptance criterion. "
+        "Respond strictly in JSON format with the following fields for each step: "
+        "`step` (the action) and `expected_result` (the validation outcome).\n\n"
+        f"{prompt_text}"
     )
 
-    simplified["generated_tests"] = response.choices[0].message.content
-    return simplified
+    def _run_openai_sync():
+        response = client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "You are an expert QA tester."},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return response.choices[0].message.content.strip()
+
+    # Run in background thread
+    return await anyio.to_thread.run_sync(_run_openai_sync)
 
 
-def extract_test_steps(ticket_description: str):
+async def summarize_results(results: str):
     """
-    Legacy version: still usable when you only have plain text description.
+    Summarize automated test results asynchronously into a concise Jira-friendly QA comment.
     """
-    prompt = f"""
-    You are a QA automation assistant. Extract structured test steps from this Jira ticket description:
-    ---
-    {ticket_description}
-    ---
-    Output in JSON format with fields: step, expected_result.
-    """
-    response = openai.ChatCompletion.create(
-        model="gpt-4-turbo",
-        messages=[
-            {"role": "system", "content": "You are an expert QA tester."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return response.choices[0].message.content
-
-
-def summarize_results(results: str):
-    """
-    Summarizes automated test execution results into a concise, Jira-friendly QA comment.
-    """
-    prompt = f"""
+    user_prompt = f"""
     Summarize these automated test results into a concise, professional QA feedback comment for Jira:
     ---
     {results}
     ---
     Include: overall test status, number of passed/failed tests (if mentioned), and next steps if any.
     """
-    response = openai.ChatCompletion.create(
-        model="gpt-4-turbo",
-        messages=[
-            {"role": "system", "content": "You are a senior QA engineer."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return response.choices[0].message.content
+
+    def _run_openai_sync():
+        response = client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "You are a senior QA engineer."},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return response.choices[0].message.content.strip()
+
+    return await anyio.to_thread.run_sync(_run_openai_sync)
+
+
+
+
+
+# from openai import OpenAI
+# from app.core.config import settings
+
+# # Initialize OpenAI client (new API structure)
+# client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+# def generate_test_steps(prompt_text: str):
+#     """
+#     Generate structured QA test steps from a given Jira LLM prompt or plain text description.
+#     The function expects a complete, contextual Jira issue prompt as returned by jira_service.get_ticket().
+#     """
+#     user_prompt = (
+#         "You are a QA automation assistant. Based on the Jira issue details below, "
+#         "generate structured, step-by-step test cases that validate each acceptance criterion. "
+#         "Respond strictly in JSON format with the following fields for each step: "
+#         "`step` (the action) and `expected_result` (the validation outcome).\n\n"
+#         f"{prompt_text}"
+#     )
+
+#     response = client.chat.completions.create(
+#         model="gpt-4-turbo",
+#         messages=[
+#             {"role": "system", "content": "You are an expert QA tester."},
+#             {"role": "user", "content": user_prompt},
+#         ],
+#     )
+
+#     return response.choices[0].message.content.strip()
+
+
+# def summarize_results(results: str):
+#     """
+#     Summarize automated test execution results into a concise, Jira-friendly QA comment.
+#     Compatible with OpenAI Python SDK >= 1.0.0.
+#     """
+#     user_prompt = f"""
+#     Summarize these automated test results into a concise, professional QA feedback comment for Jira:
+#     ---
+#     {results}
+#     ---
+#     Include: overall test status, number of passed/failed tests (if mentioned), and next steps if any.
+#     """
+
+#     response = client.chat.completions.create(
+#         model="gpt-4-turbo",
+#         messages=[
+#             {"role": "system", "content": "You are a senior QA engineer."},
+#             {"role": "user", "content": user_prompt},
+#         ],
+#     )
+
+#     return response.choices[0].message.content.strip()

@@ -1,5 +1,13 @@
+# import sys
+# import asyncio
+
+# # Apply fix for Playwright on Windows (must run BEFORE importing anything that uses asyncio/subprocess)
+# if sys.platform.startswith("win"):
+#     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI
 from app.routes import jira, qa_agent
+
 
 app = FastAPI(
     title="Curacel AI QA Agent",
