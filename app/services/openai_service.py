@@ -1,27 +1,21 @@
 import anyio
 import json
-import traceback
 import re
+import traceback
 from openai import OpenAI
 from app.core.config import settings
+from .prompt import SUMMARIZE_RESULTS_PROMPT, GENERATE_TEST_STEPS_PROMPT
 
+# Initialize OpenAI client
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 
 async def generate_test_steps(prompt_text: str):
     """
     Generate structured QA test steps asynchronously using OpenAI GPT.
-    Ensures clean, consistent JSON output: [{step, expected_result}]
-    Automatically flattens nested objects if necessary.
+    Ensures output is valid JSON list of {step, expected_result}.
     """
-    user_prompt = (
-        "You are a QA automation assistant. Based on the Jira issue details below, "
-        "generate structured, step-by-step test cases that validate each acceptance criterion. "
-        "Respond strictly in JSON array format, where each item is an object containing: "
-        "`step` (the action) and `expected_result` (the validation outcome). "
-        "Do not wrap it in any other object or text — only valid JSON.\n\n"
-        f"{prompt_text}"
-    )
+    user_prompt = GENERATE_TEST_STEPS_PROMPT.format(prompt_text=prompt_text)
 
     def _run_openai_sync():
         try:
@@ -48,231 +42,176 @@ async def generate_test_steps(prompt_text: str):
     if not raw_output:
         return [{"step": "Failed to generate test steps", "expected_result": "Manual review required"}]
 
-    # --- Clean and parse JSON output ---
     try:
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw_output.strip(), flags=re.IGNORECASE).strip()
         parsed = json.loads(cleaned)
-
-        # Handle nested structures like {"test_cases": [...]}
         if isinstance(parsed, dict):
             if "test_cases" in parsed:
                 parsed = parsed["test_cases"]
             elif "steps" in parsed:
                 parsed = parsed["steps"]
-            elif "step" in parsed and isinstance(parsed["step"], dict) and "test_cases" in parsed["step"]:
-                parsed = parsed["step"]["test_cases"]
             else:
                 parsed = [parsed]
-
-        # Flatten nested test_case structures
-        flattened = []
-        for item in parsed:
-            if isinstance(item, dict) and "steps" in item:
-                flattened.extend(item["steps"])
-            elif isinstance(item, dict):
-                flattened.append(item)
-        return flattened
-
+        return parsed
     except Exception as e:
-        print(f"[PARSING ERROR] Could not parse LLM JSON output: {e}")
-        traceback.print_exc()
+        print(f"[PARSING ERROR] Invalid JSON: {e}")
         snippet = raw_output[:300].replace("\n", " ")
         return [{
             "step": "Failed to parse test steps",
             "expected_result": f"Parsing error: {e}. Partial output: {snippet}"
         }]
 
+
+def convert_text_to_adf(text: str):
+    """
+    Convert structured plain text QA summary into rich, readable Jira ADF JSON.
+    Adds real paragraph spacing, bold headings, subheadings per test case, and emoji indicators.
+    """
+    import re
+
+    def paragraph(txt):
+        return {"type": "paragraph", "content": [{"type": "text", "text": txt.strip()}]}
+
+    def bold_heading(txt, level=3):
+        return {
+            "type": "heading",
+            "attrs": {"level": level},
+            "content": [{"type": "text", "text": txt.strip()}],
+        }
+
+    def bullet_item(txt):
+        return {
+            "type": "listItem",
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": txt.strip()}]}],
+        }
+
+    def add_spacer(content):
+        content.append({"type": "paragraph", "content": []})  # visual line break
+
+    content = []
+
+    # Add main title
+    content.append({
+        "type": "heading",
+        "attrs": {"level": 2},
+        "content": [{"type": "text", "text": "QA Feedback on Automated Test Execution"}],
+    })
+    add_spacer(content)
+
+    # --- Split sections ---
+    sections = re.split(r"(?i)(?=summary:|details:|overall status:|next steps:|disclaimer:)", text)
+    parsed = {s.split(":", 1)[0].strip().lower(): s.split(":", 1)[1].strip() for s in sections if ":" in s}
+
+    # --- Summary ---
+    if "summary" in parsed:
+        content.append(bold_heading("Summary", level=3))
+        content.append(paragraph(parsed["summary"]))
+        add_spacer(content)
+
+    # --- Details ---
+    if "details" in parsed:
+        content.append(bold_heading("Detailed Test Case Results", level=3))
+        add_spacer(content)
+
+        details = parsed["details"]
+        # Split each test case cleanly
+        test_cases = [t.strip() for t in re.split(r"Test Case ID:", details) if t.strip()]
+        for i, case in enumerate(test_cases, start=1):
+            lines = [l.strip() for l in case.split(". ") if l.strip()]
+            tc_id_match = re.match(r"(TC\d+)", lines[0]) if lines else None
+            tc_id = tc_id_match.group(1) if tc_id_match else f"Case {i}"
+
+            # Create subheading for each case
+            content.append(bold_heading(f"Test Case {i}: {tc_id}", level=4))
+
+            # Extract purpose and result
+            purpose = next((l for l in lines if l.lower().startswith("purpose:")), None)
+            result = next((l for l in lines if l.lower().startswith("result:")), None)
+
+            # Build bullets
+            bullets = {"type": "bulletList", "content": []}
+            if purpose:
+                bullets["content"].append(bullet_item(purpose))
+            if result:
+                emoji = "✅" if "pass" in result.lower() else "❌"
+                bullets["content"].append(bullet_item(f"{emoji} {result}"))
+            content.append(bullets)
+            add_spacer(content)
+
+    # --- Overall Status ---
+    if "overall status" in parsed:
+        content.append(bold_heading("Overall Status", level=3))
+        status_text = parsed["overall status"]
+        emoji = "✅" if "pass" in status_text.lower() else "❌"
+        content.append(paragraph(f"{emoji} {status_text}"))
+        add_spacer(content)
+
+    # --- Next Steps ---
+    if "next steps" in parsed:
+        content.append(bold_heading("Next Steps", level=3))
+        steps = [s.strip() for s in re.split(r"(?<=[.])\s+", parsed["next steps"]) if s.strip()]
+        bullet_block = {"type": "bulletList", "content": [bullet_item(s) for s in steps]}
+        content.append(bullet_block)
+        add_spacer(content)
+
+    # --- Disclaimer ---
+    if "disclaimer" in parsed:
+        content.append(bold_heading("Disclaimer", level=3))
+        content.append(paragraph(parsed["disclaimer"]))
+    adf_comment = {"type": "doc", "version": 1, "content": content}
+    return adf_comment
+
+
+
+
 async def summarize_results(results: str):
     """
-    Summarize automated test results into a Jira-friendly, readable QA comment.
-    Parses structured test data if present, and formats for Jira wiki markup.
+    Summarize automated test results and return ADF JSON for Jira Cloud REST API.
     """
-    # Prepare the prompt to force Jira wiki formatting
-    user_prompt = f"""
-    You are a senior QA automation engineer preparing a Jira comment based on automated test results.
-
-    The Jira comment must:
-    - Use **double asterisks** for bold text (Jira wiki markup).
-    - Begin with **QA Feedback on Automated Test Execution**
-    - Include exactly these sections in this order:
-        **Summary:**
-        **Details:**
-        **Overall Status:**
-        **Next Steps:**
-        **Disclaimer:**
-    - Separate sections with one blank line for readability.
-    - In **Details**, include each test case with ID, short purpose, and result.
-    - If all test cases passed, mark **Overall Status:** Passed.
-      If any failed, mark **Overall Status:** Failed.
-    - Keep the tone formal, concise, and professional.
-    - End with: 
-      "Please review the attached detailed test execution report for full logs and verification results."
-
-    Automated Test Results:
-    ---
-    {results}
-    ---
-    """
+    user_prompt = SUMMARIZE_RESULTS_PROMPT.format(results=results)
 
     def _run_openai_sync():
         try:
             response = client.chat.completions.create(
-                model="gpt-4-turbo",
-                temperature=0.3,
-                max_tokens=1200,
+                model="gpt-4o",
+                temperature=0.4,
+                max_tokens=1500,
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "You are a senior QA automation engineer writing structured Jira comments. "
-                            "Use only Jira wiki formatting (no markdown code blocks, no single *). "
-                            "Always return double-asterisk bold headings and clean paragraphs."
+                            "You are a senior QA engineer writing professional Jira summaries. "
+                            "Output structured plain text with sections: Summary, Details, Overall Status, "
+                            "Next Steps, and Disclaimer. Do NOT use HTML, Markdown, or Jira wiki markup."
                         ),
                     },
                     {"role": "user", "content": user_prompt},
                 ],
             )
-
             content = response.choices[0].message.content.strip() if response.choices else ""
             if not content:
                 raise ValueError("Empty response from OpenAI.")
         except Exception as e:
             print(f"[OPENAI ERROR] Failed to summarize results: {e}")
             traceback.print_exc()
-            return (
-                "**QA Feedback on Automated Test Execution**\n\n"
-                "**Summary:**\nUnable to generate automated summary.\n\n"
-                "**Details:**\nInternal processing error.\n\n"
-                "**Overall Status:** Failed to generate feedback.\n\n"
-                "**Next Steps:**\n- Review raw logs manually.\n- Retry automated execution.\n\n"
-                "**Disclaimer:**\nPlease review the attached detailed test report."
+            content = (
+                "Summary: Automated QA summary unavailable.\n"
+                "Details: An internal error occurred while generating this summary.\n"
+                "Overall Status: Failed to generate feedback.\n"
+                "Next Steps: Review raw logs manually and retry automated execution.\n"
+                "Disclaimer: Please refer to the attached test report for full details."
             )
 
-        # Cleanup for Jira rendering
-        text = content
-        text = re.sub(r"[`#_>]+", "", text)  # remove markdown remnants
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = text.strip()
-
-        # Ensure double asterisks for Jira bold headers
-        text = re.sub(r"(?<!\*)\*(Summary|Details|Overall Status|Next Steps|Disclaimer):(?=\s|$)", r"**\1:**", text)
-        text = re.sub(r"(?<!\*)\*QA Feedback on Automated Test Execution\*",
-                      r"**QA Feedback on Automated Test Execution**", text)
-
-        # Ensure consistent section spacing
-        text = re.sub(r"(?<=\n)(?=\*\*)", "\n", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
+        # Clean response
+        text = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
+        text = re.sub(r"[#*_`>]+", "", text)
+        text = re.sub(r"\s{2,}", " ", text)
         text = text.strip()
 
         return text
 
-    return await anyio.to_thread.run_sync(_run_openai_sync)
+    plain_text = await anyio.to_thread.run_sync(_run_openai_sync)
 
-
-# async def summarize_results(results: str):
-#     """
-#     Summarize automated test results into a structured, Jira-friendly comment.
-#     Produces *bold* headers (Jira wiki format) with good spacing and clear readability.
-#     Automatically detects missing headers and reformats accordingly.
-#     """
-#     user_prompt = f"""
-#     Summarize these automated test results into a professional QA comment for Jira.
-
-#     *Formatting Rules:*
-#     - Use Jira-style bold headers with single asterisks (e.g., *Summary:*).
-#     - Include exactly three sections:
-#       *Summary:*
-#       *Detailed Findings:*
-#       *Next Steps:*
-#     - Separate each section with one blank line.
-#     - Keep it descriptive, concise, and clear.
-#     - Avoid using markdown code fences, hashes (#), or underscores.
-#     - If there is no test failure, explicitly state all tests passed.
-
-#     Test Results:
-#     ---
-#     {results}
-#     ---
-#     """
-
-#     def _run_openai_sync():
-#         try:
-#             response = client.chat.completions.create(
-#                 model="gpt-4-turbo",
-#                 temperature=0.45,
-#                 max_tokens=1000,
-#                 messages=[
-#                     {
-#                         "role": "system",
-#                         "content": (
-#                             "You are a senior QA engineer writing polished Jira comments "
-#                             "for automated test runs. Always include all three sections clearly."
-#                         ),
-#                     },
-#                     {"role": "user", "content": user_prompt},
-#                 ],
-#             )
-#             content = response.choices[0].message.content.strip() if response.choices else ""
-#             if not content:
-#                 raise ValueError("Empty response from OpenAI.")
-#         except Exception as e:
-#             print(f"[OPENAI ERROR] Failed to summarize results: {e}")
-#             traceback.print_exc()
-#             return (
-#                 "*Summary:*\nAutomated QA summary unavailable.\n\n"
-#                 "*Detailed Findings:*\nAn internal error occurred while generating this summary.\n\n"
-#                 "*Next Steps:*\nPlease review the raw test logs manually."
-#             )
-
-#         # --- Gentle cleanup (don’t strip important structure) ---
-#         text = content.replace("**", "*").replace("__", "")
-#         text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)  # remove fenced code blocks only
-#         text = re.sub(r"\n{3,}", "\n\n", text).strip()
-
-#         # --- Detect section headers or auto-split if missing ---
-#         if not re.search(r"(?i)\bsummary\b", text):
-#             # No explicit sections found — infer structure automatically
-#             paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-#             summary = paragraphs[0] if len(paragraphs) > 0 else "All automated tests executed successfully."
-#             findings = paragraphs[1] if len(paragraphs) > 1 else "All test cases passed as expected."
-#             next_steps = paragraphs[2] if len(paragraphs) > 2 else "Proceed with deployment and monitor post-release behavior."
-#             text = (
-#                 f"*Summary:*\n{summary}\n\n"
-#                 f"*Detailed Findings:*\n{findings}\n\n"
-#                 f"*Next Steps:*\n{next_steps}"
-#             )
-#             return text.strip()
-
-#         # --- Extract structured sections if they exist ---
-#         sections = {"summary": "", "detailed findings": "", "next steps": ""}
-#         current = None
-#         for line in text.splitlines():
-#             match = re.match(r"(?i)^(summary|detailed findings|next steps)[:\s]*", line.strip())
-#             if match:
-#                 current = match.group(1).lower()
-#                 continue
-#             elif current:
-#                 sections[current] += line.strip() + " "
-
-#         # Fill defaults for any missing parts
-#         for k, v in sections.items():
-#             if not v.strip():
-#                 if k == "summary":
-#                     sections[k] = "All automated tests executed successfully."
-#                 elif k == "detailed findings":
-#                     sections[k] = "All test cases passed without error."
-#                 elif k == "next steps":
-#                     sections[k] = "Proceed with deployment and continue monitoring system behavior."
-
-#         formatted = (
-#             f"*Summary:*\n{sections['summary'].strip()}\n\n"
-#             f"*Detailed Findings:*\n{sections['detailed findings'].strip()}\n\n"
-#             f"*Next Steps:*\n{sections['next steps'].strip()}"
-#         ).strip()
-
-#         # Normalize whitespace
-#         formatted = re.sub(r"\s{2,}", " ", formatted)
-#         formatted = re.sub(r"\n{3,}", "\n\n", formatted)
-#         return formatted
-
-#     return await anyio.to_thread.run_sync(_run_openai_sync)
+    # Convert plain text to ADF JSON
+    adf_comment = convert_text_to_adf(plain_text)
+    return adf_comment

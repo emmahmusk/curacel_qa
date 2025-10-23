@@ -27,26 +27,34 @@ async def get_ticket(ticket_id: str):
     return await anyio.to_thread.run_sync(_fetch)
 
 
-async def add_comment(ticket_id: str, comment: str):
+async def add_comment(ticket_id: str, comment):
     """
     Post a comment to a Jira issue asynchronously.
+    Supports both plain text and Atlassian Document Format (ADF) JSON payloads.
     """
     url = f"{settings.JIRA_BASE_URL}/rest/api/3/issue/{ticket_id}/comment"
     auth = HTTPBasicAuth(settings.JIRA_EMAIL, settings.JIRA_API_TOKEN)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    payload = {
-        "body": {
-            "type": "doc",
-            "version": 1,
-            "content": [
-                {
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": comment}],
-                }
-            ],
-        }
-    }
 
+    # If comment is a string, wrap it into an ADF doc format
+    if isinstance(comment, str):
+        payload = {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": comment}],
+                    }
+                ],
+            }
+        }
+    elif isinstance(comment, dict):
+        # Assume comment is already in ADF format (from LLM output)
+        payload = {"body": comment}
+    else:
+        raise TypeError("comment must be either a string or ADF JSON object (dict).")
 
     def _post():
         response = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload))
