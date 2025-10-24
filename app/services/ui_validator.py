@@ -20,7 +20,6 @@ def _run_playwright_worker(test_steps):
         # Ensure JSON serialization
         test_data = json.dumps(test_steps)
 
-        # Use the same Python executable (ensures venv isolation)
         result = subprocess.run(
             [sys.executable, "app/services/ui_playwright_worker.py", test_data],
             capture_output=True,
